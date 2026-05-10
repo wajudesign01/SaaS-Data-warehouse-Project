@@ -1,0 +1,434 @@
+/*
+     =================================================================================================
+     cleaning events table ----silver layer
+     ================================================================================================
+     */  
+     TRUNCATE TABLE silver_layer.events;
+
+INSERT INTO silver_layer.events (
+    event_id,
+    user_id,
+    event_type,
+    event_timestamp,
+    feature_name
+)
+
+SELECT 
+    event_id,
+    user_id,
+    event_type,
+    event_timestamp,
+    feature_name
+
+FROM (
+
+    SELECT 
+        event_id,
+        user_id,
+        event_type,
+
+        CASE
+
+            -- ISO format (must come FIRST)
+            WHEN event_timestamp LIKE '%T%Z'
+                THEN STR_TO_DATE(
+                    REPLACE(
+                        REPLACE(event_timestamp, 'T', ' '),
+                        'Z',
+                        ''
+                    ),
+                    '%Y-%m-%d %H:%i:%s'
+                )
+
+            -- Standard format
+            WHEN event_timestamp REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2} '
+                THEN STR_TO_DATE(
+                    event_timestamp,
+                    '%Y-%m-%d %H:%i:%s'
+                )
+
+            -- European format
+            WHEN event_timestamp REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}'
+                THEN STR_TO_DATE(
+                    event_timestamp,
+                    '%d/%m/%Y %H:%i'
+                )
+
+            ELSE NULL
+
+        END AS event_timestamp,
+
+        CASE 
+            WHEN feature_name = '' OR feature_name IS NULL
+                THEN 'N/A'
+            ELSE feature_name
+        END AS feature_name,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY event_id
+
+            ORDER BY 
+
+                CASE
+
+                    -- ISO format FIRST
+                    WHEN event_timestamp LIKE '%T%Z'
+                        THEN STR_TO_DATE(
+                            REPLACE(
+                                REPLACE(event_timestamp, 'T', ' '),
+                                'Z',
+                                ''
+                            ),
+                            '%Y-%m-%d %H:%i:%s'
+                        )
+
+                    -- Standard format
+                    WHEN event_timestamp REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2} '
+                        THEN STR_TO_DATE(
+                            event_timestamp,
+                            '%Y-%m-%d %H:%i:%s'
+                        )
+
+                    -- European format
+                    WHEN event_timestamp REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}'
+                        THEN STR_TO_DATE(
+                            event_timestamp,
+                            '%d/%m/%Y %H:%i'
+                        )
+
+                    ELSE NULL
+
+                END DESC
+
+        ) AS t
+
+    FROM events
+
+) AS event_data
+
+WHERE t = 1
+AND event_timestamp IS NOT NULL;
+     
+     
+     /*
+     =================================================================================================
+     cleaning payments table ----silver layer
+     ================================================================================================
+     */ 
+     truncate table silver_layer.payments;
+     insert into silver_layer.payments(
+     payment_id,
+	user_id,
+	payment_date,
+	amount,
+	currency)
+     
+     with rank_payment as (select 
+		 payment_id,
+		 user_id,
+		 CASE 
+        -- YYYY-MM-DD format 
+        WHEN payment_date REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+            THEN STR_TO_DATE(payment_date, '%Y-%m-%d')
+
+        -- DD/MM/YYYY format 
+        WHEN payment_date REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}'
+            THEN STR_TO_DATE(payment_date, '%d/%m/%Y')
+
+        --  DD-MM-YYYY OR MM-DD-YYYY format
+        WHEN payment_date REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
+		THEN 
+ CASE 
+                    -- If first part > 12 then its a DAY
+		WHEN CAST(SUBSTRING_INDEX(payment_date, '-', 1) AS UNSIGNED) > 12
+		THEN STR_TO_DATE(payment_date, '%d-%m-%Y')
+
+				-- If second part > 12 then its MONTH first (MM-DD)
+		WHEN CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(payment_date, '-', 2), '-', -1) AS UNSIGNED) > 12
+		THEN STR_TO_DATE(payment_date, '%m-%d-%Y')
+                        
+		ELSE STR_TO_DATE(payment_date, '%d-%m-%Y')
+	END
+
+        ELSE NULL
+    END AS payment_date,
+		cast(abs(amount) as unsigned) as  amount,
+		 currency,
+		
+        row_number() over( partition by payment_id order by 
+         CASE 
+        WHEN payment_date REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+		THEN STR_TO_DATE(payment_date, '%Y-%m-%d')
+        WHEN payment_date REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}'
+		THEN STR_TO_DATE(payment_date, '%d/%m/%Y')
+        WHEN payment_date REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
+		THEN 
+ CASE 
+		WHEN CAST(SUBSTRING_INDEX(payment_date, '-', 1) AS UNSIGNED) > 12
+		THEN STR_TO_DATE(payment_date, '%d-%m-%Y')
+		WHEN CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(payment_date, '-', 2), '-', -1) AS UNSIGNED) > 12
+		THEN STR_TO_DATE(payment_date, '%m-%d-%Y')
+		ELSE STR_TO_DATE(payment_date, '%d-%m-%Y')
+	END
+
+        ELSE NULL
+    END desc) as t
+         from payments
+         where payment_date is not null
+		)
+        select
+			payment_id,
+			user_id,
+			payment_date,
+			amount,
+			currency
+        from rank_payment
+        where t=1;
+     
+     
+      /*
+     =================================================================================================
+     cleaning sessions table ----silver layer
+     ================================================================================================
+     */ 
+     truncate table silver_layer.sessions;
+     insert into silver_layer.sessions(
+     session_id,
+	user_id,
+	session_start,
+	session_end,
+	session_duration_seconds)
+     
+with cleaned_sessions as(
+SELECT 
+    session_id,
+    user_id,
+    CASE
+        WHEN
+            session_start LIKE '%T%Z'
+        THEN
+            STR_TO_DATE(REPLACE(REPLACE(TRIM(session_start), 'T', ' '),
+                        'Z',
+                        ''),
+                    '%Y-%m-%d %H:%i:%s')
+        WHEN session_start REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}$' THEN STR_TO_DATE(TRIM(session_start), '%d/%m/%Y %H:%i:%s')
+        WHEN
+            session_start REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}$'
+        THEN
+            STR_TO_DATE(CONCAT(TRIM(session_start), ':00'),
+                    '%d/%m/%Y %H:%i:%s')
+        WHEN session_start REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$' THEN STR_TO_DATE(TRIM(session_start), '%Y-%m-%d %H:%i:%s')
+        ELSE NULL
+    END AS session_start,
+    CASE
+        WHEN
+            session_end LIKE '%T%Z'
+        THEN
+            STR_TO_DATE(REPLACE(REPLACE(TRIM(session_end), 'T', ' '),
+                        'Z',
+                        ''),
+                    '%Y-%m-%d %H:%i:%s')
+        WHEN session_end REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}$' THEN STR_TO_DATE(TRIM(session_end), '%d/%m/%Y %H:%i:%s')
+        WHEN
+            session_end REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}$'
+        THEN
+            STR_TO_DATE(CONCAT(TRIM(session_end), ':00'),
+                    '%d/%m/%Y %H:%i:%s')
+        WHEN session_end REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$' THEN STR_TO_DATE(TRIM(session_end), '%Y-%m-%d %H:%i:%s')
+        ELSE NULL
+    END AS session_end,
+    
+    CAST(
+    CASE
+        WHEN TRIM(session_duration_seconds) IN ('', 'N/A')
+        THEN 0
+        ELSE session_duration_seconds
+    END AS SIGNED
+) AS session_duration_seconds
+FROM
+    sessions),
+    rank_sessions as(
+  select * , 
+  row_number() over(partition by session_id order by session_start desc)t
+  from  cleaned_sessions)
+  select 
+  session_id,
+  user_id,
+  session_start,
+  session_end,
+  session_duration_seconds
+  from rank_sessions
+  where t=1;
+  
+  
+   /*
+     =================================================================================================
+     cleaning subscriptions table ----silver layer
+     ================================================================================================
+     */ 
+     TRUNCATE TABLE silver_layer.subscriptions;
+
+INSERT INTO silver_layer.subscriptions (
+    subscription_id,
+    user_id,
+    plan_type,
+    start_date,
+    end_date,
+    status
+)
+
+WITH cleaned_subscription AS (
+
+    SELECT
+        NULLIF(TRIM(subscription_id), '') AS subscription_id,
+        NULLIF(TRIM(user_id), '') AS user_id,
+        TRIM(plan_type) AS plan_type,
+
+        /* ---------------- START DATE CLEANING ---------------- */
+
+        CASE
+
+            -- YYYY-MM-DD
+            WHEN TRIM(start_date) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN STR_TO_DATE(TRIM(start_date), '%Y-%m-%d')
+
+            -- DD-MM-YYYY
+            WHEN TRIM(start_date) REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+                 AND CAST(SUBSTRING(TRIM(start_date),1,2) AS UNSIGNED) > 12
+            THEN STR_TO_DATE(TRIM(start_date), '%d-%m-%Y')
+
+            -- MM-DD-YYYY
+            WHEN TRIM(start_date) REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+            THEN STR_TO_DATE(TRIM(start_date), '%m-%d-%Y')
+
+            -- YYYY/MM/DD
+            WHEN TRIM(start_date) REGEXP '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'
+            THEN STR_TO_DATE(TRIM(start_date), '%Y/%m/%d')
+
+            -- DD/MM/YYYY
+            WHEN TRIM(start_date) REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+            THEN STR_TO_DATE(TRIM(start_date), '%d/%m/%Y')
+
+            ELSE NULL
+
+        END AS start_date,
+
+        /* ---------------- END DATE CLEANING ---------------- */
+
+        CASE
+
+            -- YYYY-MM-DD
+            WHEN TRIM(end_date) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN STR_TO_DATE(TRIM(end_date), '%Y-%m-%d')
+
+            -- DD-MM-YYYY
+            WHEN TRIM(end_date) REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+                 AND CAST(SUBSTRING(TRIM(end_date),1,2) AS UNSIGNED) > 12
+            THEN STR_TO_DATE(TRIM(end_date), '%d-%m-%Y')
+
+            -- MM-DD-YYYY
+            WHEN TRIM(end_date) REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+            THEN STR_TO_DATE(TRIM(end_date), '%m-%d-%Y')
+
+            -- YYYY/MM/DD
+            WHEN TRIM(end_date) REGEXP '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'
+            THEN STR_TO_DATE(TRIM(end_date), '%Y/%m/%d')
+
+            -- DD/MM/YYYY
+            WHEN TRIM(end_date) REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+            THEN STR_TO_DATE(TRIM(end_date), '%d/%m/%Y')
+
+            ELSE NULL
+
+        END AS end_date,
+
+        TRIM(status) AS status
+
+    FROM subscriptions
+),
+
+rank_subscription AS (
+
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY subscription_id
+            ORDER BY start_date DESC
+        ) AS t
+    FROM cleaned_subscription
+
+)
+
+SELECT
+    subscription_id,
+    user_id,
+    plan_type,
+    start_date,
+    end_date,
+    status
+
+FROM rank_subscription
+
+WHERE t = 1;
+    
+    
+     /*
+     =================================================================================================
+     cleaning users table ----silver layer
+     ================================================================================================
+     */ 
+     truncate table silver_layer.users;
+     insert into silver_layer.users(
+     user_id ,
+	signup_date,
+	country ,
+	acquisition_channel,
+	device_type )
+     select 
+		 user_id,
+		 CASE 											-- signup_date
+        -- YYYY-MM-DD
+        WHEN signup_date REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+        THEN STR_TO_DATE(signup_date, '%Y-%m-%d')
+
+        -- DD-MM-YYYY (day > 12 to differentiate)
+        WHEN signup_date REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+             AND CAST(SUBSTRING(signup_date, 1, 2) AS UNSIGNED) > 12
+        THEN STR_TO_DATE(signup_date, '%d-%m-%Y')
+
+        -- MM-DD-YYYY (month <= 12)
+        WHEN signup_date REGEXP '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+        THEN STR_TO_DATE(signup_date, '%m-%d-%Y')
+
+        -- YYYY/MM/DD
+        WHEN signup_date REGEXP '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'
+        THEN STR_TO_DATE(signup_date, '%Y/%m/%d')
+
+        -- DD/MM/YYYY
+        WHEN signup_date REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+        THEN STR_TO_DATE(signup_date, '%d/%m/%Y')
+
+        ELSE NULL 
+    END AS signup_date
+,
+case 
+	when country='US' then 'United States'
+    when country='IN' then 'India'
+    when country='UK' then 'United Kingdom'
+    when country='NG' then 'Nigeria'
+    when country='usa' then 'United States'
+    when country='CA' then 'Canada'
+    when country='' then 'N/A'
+    when country='BR' then 'Brazil'
+    when country='DE' then 'Germany'
+    when country='FR' then 'France'
+    else country
+    end as  country
+,
+		 acquisition_channel,
+		 device_type
+     from users
+  ;
+
+
+     
